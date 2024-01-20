@@ -1,0 +1,307 @@
+from datetime import datetime
+import sqlite3
+from opencage.geocoder import OpenCageGeocode
+from geopy.distance import geodesic
+
+class CabAggregator:
+	# The path to the SQLite database file. Change this path based on your setup.
+	# The database is created at this path if it does not exist when the program is run.
+	# The program connects to the database using SQLite and retrieves data as needed during execution.
+    def __init__(self):
+        db_path = "C:/Users/Apple/Downloads/cab_aggregator.db"
+        self.conn = sqlite3.connect(db_path)
+        self.create_tables()
+        self.user_id_counter = self.get_last_id('users')
+        self.driver_id_counter = self.get_last_id('drivers')
+
+    def __del__(self):
+        if self.conn:
+            self.conn.close()
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+          CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT,
+            payment_methods TEXT,
+            balance REAL
+          )
+        ''')
+        cursor.execute('''
+      CREATE TABLE IF NOT EXISTS rides (
+        ride_id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        driver_id INTEGER,
+        source TEXT,
+        destination TEXT,
+        vehicle_type TEXT,
+        payment_method TEXT,
+        ride_time DATETIME,
+        status TEXT,
+        distance REAL,
+        cost REAL,
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (driver_id) REFERENCES drivers(driver_id)
+      )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS drivers (
+                driver_id INTEGER PRIMARY KEY,
+                name TEXT,
+                vehicle_type TEXT,
+                rating REAL
+             )
+        ''')
+        self.conn.commit()
+
+    def get_last_id(self, table_name):
+        cursor = self.conn.cursor()
+        query = f'SELECT MAX({table_name[:-1]}_id) FROM {table_name}'
+        result = cursor.execute(query).fetchone()[0]
+        return result if result else 1
+
+    def register_user(self, name, email, payment_methods='', initial_balance=0.0):
+        cursor = self.conn.cursor()
+
+        # Check if user with the same name or email already exists
+        existing_user = cursor.execute('SELECT * FROM users WHERE name=? OR email=?', (name, email)).fetchone()
+        if existing_user:
+            print(f"Error: User with the name '{name}' or email '{email}' already registered with User ID: {existing_user[0]}")
+            return
+
+        cursor.execute('INSERT INTO users (name, email, payment_methods, balance) VALUES (?, ?, ?, ?)',
+                       (name, email, payment_methods, initial_balance))
+        self.conn.commit()
+        print(f"User {name} registered successfully with User ID: {self.user_id_counter}")
+        self.user_id_counter += 1
+
+    def register_driver(self, name, vehicle_type, rating):
+        cursor = self.conn.cursor()
+
+        # Check if driver with the same name already exists
+        existing_driver = cursor.execute('SELECT * FROM drivers WHERE name=?', (name,)).fetchone()
+        if existing_driver:
+            print(f"Error: Driver with the name '{name}' already registered with Driver ID: {existing_driver[0]}")
+            return
+
+        cursor.execute('INSERT INTO drivers (name, vehicle_type, rating) VALUES (?, ?, ?)',
+                       (name, vehicle_type, rating))
+        self.conn.commit()
+        print(f"Driver {name} registered successfully with Driver ID: {self.driver_id_counter}")
+        self.driver_id_counter += 1
+
+    def view_available_drivers(self, vehicle_type, rating_threshold=4.5):
+        cursor = self.conn.cursor()
+        available_drivers = cursor.execute('SELECT * FROM drivers WHERE vehicle_type=? AND rating >= ?',
+                                          (vehicle_type, rating_threshold)).fetchall()
+        if not available_drivers:
+            print("No available drivers for the selected vehicle type and rating.")
+        else:
+            print("Available Drivers:")
+            for driver in available_drivers:
+                print(f"Driver ID: {driver[0]}, Name: {driver[1]}, Vehicle Type: {driver[2]}, Rating: {driver[3]}")
+
+    def view_user_details(self, user_id):
+        cursor = self.conn.cursor()
+        user = cursor.execute('SELECT * FROM users WHERE user_id=?', (user_id,)).fetchone()
+        if user:
+            print(f"User ID: {user[0]}, Name: {user[1]}, Email: {user[2]}, Payment Methods: {user[3]}, Balance: {user[4]}")
+        else:
+            print("User not found.")
+
+    def validate_driver_availability(self, vehicle_type, rating_threshold=4.5):
+        cursor = self.conn.cursor()
+        available_drivers = cursor.execute('SELECT * FROM drivers WHERE vehicle_type=? AND rating >= ?',
+                                          (vehicle_type, rating_threshold)).fetchall()
+        return bool(available_drivers)
+
+    def book_ride(self, user_id, source, destination, vehicle_type, payment_method='cash', ride_time=None):
+        cursor = self.conn.cursor()
+
+        try:
+            user = self.validate_user(user_id)
+            payment_method = self.validate_payment_method(user_id, payment_method)
+
+            if ride_time:
+                ride_time = self.validate_ride_time(ride_time)
+            else:
+                immediate_ride = input("Do you want to book an immediate ride? (Yes/No): ").lower() == 'yes'
+                if immediate_ride:
+                    ride_time = datetime.now()
+                else:
+                    scheduled_time_input = input("Enter ride time (YYYY-MM-DD HH:MM): ")
+                    ride_time = datetime.strptime(scheduled_time_input, "%Y-%m-%d %H:%M")
+
+            if not self.validate_driver_availability(vehicle_type):
+                raise ValueError("No available drivers for the selected vehicle type and rating.")
+
+            available_drivers = cursor.execute('SELECT * FROM drivers WHERE vehicle_type=? AND rating >= ?',
+                                              (vehicle_type, 4.5)).fetchall()
+            driver_id = available_drivers[0][0]  # Assign the first available driver
+        except ValueError as e:
+            raise ValueError(f"Error: {e}")
+
+        distance = self.calculate_distance(source, destination)
+
+        cost = self.calculate_ride_cost(distance)
+
+        ride_status = "Pending"
+        cursor.execute(
+            'INSERT INTO rides (user_id, driver_id, source, destination, vehicle_type, payment_method, ride_time, status, distance, cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (user_id, driver_id, source, destination, vehicle_type, payment_method, ride_time, ride_status, distance, cost))
+        self.conn.commit()
+
+        driver_details = cursor.execute('SELECT * FROM drivers WHERE driver_id=?', (driver_id,)).fetchone()
+
+        print(f"Ride booked successfully! Details:\n"
+              f"Ride ID: {cursor.lastrowid}, Source: {source}, Destination: {destination}, Vehicle Type: {vehicle_type}, Payment Method: {payment_method}, "
+              f"Ride Time: {ride_time}, Status: {ride_status}, Distance: {distance} km, Cost: {cost}\n"
+              f"Driver Details - Name: {driver_details[1]}, Vehicle Type: {driver_details[2]}, Rating: {driver_details[3]}")
+
+        return cursor.lastrowid  # Return the ride_id
+
+    def complete_ride(self, ride_id):
+        cursor = self.conn.cursor()
+
+        ride = cursor.execute('SELECT * FROM rides WHERE ride_id=?', (ride_id,)).fetchone()
+
+        if ride and ride[8] == 'Completed':
+            print(f"Ride {ride_id} has already been completed.")
+            return
+
+        cost = self.calculate_ride_cost(ride[9])
+
+        user_id = ride[1]
+
+        user = self.validate_user(user_id)
+        if user[4] < cost:
+            raise ValueError("Insufficient balance. Please add funds to your account.")
+
+        cursor.execute('UPDATE users SET balance=? WHERE user_id=?', (user[4] - cost, user_id))
+
+        cursor.execute('UPDATE rides SET status=?, cost=? WHERE ride_id=?', ("Completed", cost, ride_id))
+        self.conn.commit()
+        print(f"Ride {ride_id} successfully completed.")
+
+    def calculate_distance(self, source, destination):
+        source_coordinates = self.get_coordinates(source)
+        destination_coordinates = self.get_coordinates(destination)
+        return geodesic(source_coordinates, destination_coordinates).kilometers
+
+    def get_coordinates(self, location):
+        # Note: To use the geocoding feature, you need to sign up on the OpenCage website (https://opencagedata.com/)
+        # and obtain an API key. Replace 'YOUR_OPENCAGE_API_KEY' with your actual API key.
+        api_key = 'YOUR_OPENCAGE_API_KEY'
+        geocoder = OpenCageGeocode(api_key)
+        result = geocoder.geocode(location)
+
+        if result and result[0]['geometry']:
+            latitude = result[0]['geometry']['lat']
+            longitude = result[0]['geometry']['lng']
+            return latitude, longitude
+        else:
+            raise ValueError(f"Unable to retrieve coordinates for location: {location}")
+
+    def calculate_ride_cost(self, distance):
+        cost_per_km = 1.5
+        return distance * cost_per_km
+
+    def validate_user(self, user_id):
+        cursor = self.conn.cursor()
+        user = cursor.execute('SELECT * FROM users WHERE user_id=?', (user_id,)).fetchone()
+        if not user:
+            raise ValueError("User not registered.")
+        return user
+
+    def validate_payment_method(self, user_id, payment_method):
+        user = self.validate_user(user_id)
+        allowed_payment_methods = user[3].split(',')
+        if payment_method not in allowed_payment_methods:
+            raise ValueError("Invalid payment method.")
+        return payment_method
+
+    def validate_ride_time(self, ride_time):
+        current_time = datetime.now()
+        if ride_time < current_time:
+            raise ValueError("Invalid ride time. Please provide a future time.")
+        return ride_time
+
+    def view_previous_rides(self, user_id):
+        cursor = self.conn.cursor()
+
+        try:
+            user = self.validate_user(user_id)
+        except ValueError as e:
+            raise ValueError(f"Error: {e}")
+
+        rides = [ride for ride in cursor.execute('SELECT * FROM rides WHERE user_id=?', (user_id,)).fetchall()]
+        for ride in rides:
+            print(f"Ride ID: {ride[0]}, Source: {ride[3]}, Destination: {ride[4]}, Vehicle Type: {ride[5]}, "
+                  f"Payment Method: {ride[6]}, Ride Time: {ride[7]}, Status: {ride[8]}, Cost: {ride[9]}")
+
+def main():
+    cab_aggregator = CabAggregator()
+
+    while True:
+        print("\nOptions:")
+        print("1. Register User")
+        print("2. Register Driver")
+        print("3. Book Ride")
+        print("4. Complete Ride")
+        print("5. View Previous Rides")
+        print("6. Exit")
+
+        choice = input("Enter your choice (1-6): ")
+
+        if choice == '1':
+            user_name = input("Enter user name: ")
+            user_email = input("Enter user email: ")
+            payment_methods = input("Enter payment methods (comma-separated): ")
+            initial_balance = float(input("Enter initial balance: "))
+            cab_aggregator.register_user(name=user_name, email=user_email, payment_methods=payment_methods,
+                                         initial_balance=initial_balance)
+
+        elif choice == '2':
+            driver_name = input("Enter driver name: ")
+            vehicle_type = input("Enter vehicle type: ")
+            driver_rating = float(input("Enter driver rating: "))
+            cab_aggregator.register_driver(name=driver_name, vehicle_type=vehicle_type, rating=driver_rating)
+
+        elif choice == '3':
+            user_id = int(input("Enter User ID: "))
+            source = input("Enter source: ")
+            destination = input("Enter destination: ")
+            vehicle_type = input("Enter vehicle type: ")
+            payment_method = input("Enter payment method: ")
+            ride_time_input = input("Do you want to schedule the ride? (Yes/No): ").lower() == 'yes'
+            ride_time = None
+            if ride_time_input:
+                scheduled_time_input = input("Enter ride time (YYYY-MM-DD HH:MM): ")
+                ride_time = datetime.strptime(scheduled_time_input, "%Y-%m-%d %H:%M")
+
+            try:
+                ride_id = cab_aggregator.book_ride(user_id=user_id, source=source, destination=destination,
+                                                   vehicle_type=vehicle_type, payment_method=payment_method,
+                                                   ride_time=ride_time)
+            except ValueError as e:
+                print(f"Error: {e}")
+
+        elif choice == '4':
+            ride_id = int(input("Enter Ride ID to complete: "))
+            cab_aggregator.complete_ride(ride_id)
+
+        elif choice == '5':
+            user_id = int(input("Enter User ID: "))
+            cab_aggregator.view_previous_rides(user_id=user_id)
+
+        elif choice == '6':
+            print("Exiting the program. Thank you!")
+            break
+
+        else:
+            print("Invalid choice. Please enter a number between 1 and 6.")
+
+if __name__ == "__main__":
+    main()
